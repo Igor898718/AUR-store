@@ -236,12 +236,18 @@ def _safe_link(url: str, text: str | None = None) -> str:
 _FLAG_LABELS = {"make": "сборка", "check": "проверка", "optional": "опционально"}
 
 
-def format_package_html(info: dict) -> str:
+def format_package_html(info: dict, installed: bool = False) -> str:
     """Собрать HTML-представление сведений о пакете для QTextBrowser."""
     name = _escape(info.get("name"))
     version = _escape(info.get("version"))
     description = _escape(info.get("description"))
     links = info.get("links") or {}
+    installed_badge = (
+        '<span style="background:#1a7f37; color:#ffffff; padding:2px 8px; '
+        'border-radius:4px; font-size:9.5pt; margin-left:6px;">установлен</span>'
+        if installed
+        else ""
+    )
 
     rows: list[tuple[str, str]] = []
     if info.get("package_base"):
@@ -304,7 +310,7 @@ def format_package_html(info: dict) -> str:
   <div style="font-size:20pt; font-weight:700; color:#1f2328;">{name}</div>
   <div style="margin-top:2px;">
     <span style="background:#1793d1; color:#ffffff; padding:2px 8px;
-                 border-radius:4px; font-size:9.5pt;">{version}</span>
+                 border-radius:4px; font-size:9.5pt;">{version}</span> {installed_badge}
   </div>
   <p style="margin:14px 0 16px 0; font-size:10.5pt; color:#24292f;">{description}</p>
   <table cellspacing="0" cellpadding="0" style="font-size:10pt;">{meta_html}</table>

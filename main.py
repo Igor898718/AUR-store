@@ -2,7 +2,8 @@
 """AUR Store — простой графический магазин пакетов Arch User Repository.
 
 Интерфейс загружает базу имён пакетов AUR, ищет по ней, показывает сведения
-со страницы пакета и запускает aur_helper.py для сборки и установки.
+со страницы пакета, помечает установленные пакеты и запускает aur_helper.py
+для установки/переустановки либо pacman для удаления.
 """
 
 from __future__ import annotations
@@ -14,14 +15,18 @@ import shlex
 import shutil
 import subprocess
 import sys
+import time
 import urllib.parse
 from pathlib import Path
 
 try:
     from PyQt6.QtCore import (
+        QEvent,
         QObject,
         QProcess,
+        QProcessEnvironment,
         QRunnable,
+        QSettings,
         QSize,
         Qt,
         QThreadPool,
@@ -31,6 +36,7 @@ try:
     )
     from PyQt6.QtGui import (
         QAction,
+        QColor,
         QDesktopServices,
         QFontDatabase,
         QIcon,
@@ -38,11 +44,13 @@ try:
     )
     from PyQt6.QtWidgets import (
         QApplication,
+        QCheckBox,
         QDialog,
         QHBoxLayout,
         QLabel,
         QLineEdit,
         QListWidget,
+        QListWidgetItem,
         QMainWindow,
         QMessageBox,
         QPlainTextEdit,
@@ -121,6 +129,22 @@ QPushButton#installButton:disabled {
     border-color: #a7d5ec;
     color: #f5fbff;
 }
+QPushButton#removeButton {
+    color: #b42318;
+    border-color: #f0b8b3;
+}
+QPushButton#removeButton:hover {
+    background: #fff1ef;
+}
+QPushButton#removeButton:disabled {
+    color: #8c959f;
+    background: #f0f2f4;
+    border-color: #d0d7de;
+}
+QCheckBox {
+    color: #24292f;
+    font-size: 10pt;
+}
 QListWidget {
     background: #ffffff;
     border: 1px solid #d0d7de;
@@ -180,6 +204,30 @@ def _thousands(value: int) -> str:
     return f"{value:,}".replace(",", " ")
 
 
+def _installed_packages() -> set[str] | None:
+    """Вернуть имена установленных пакетов через pacman.
+
+    Пустое множество означает, что pacman нет; None — что запрос не удался
+    и прежние отметки лучше не сбрасывать.
+    """
+    if shutil.which("pacman") is None:
+        return set()
+    try:
+        result = subprocess.run(
+            ["pacman", "-Qq"],
+            capture_output=True,
+            text=True,
+            errors="replace",
+            check=False,
+            timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    return {line.strip() for line in result.stdout.splitlines() if line.strip()}
+
+
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -191,12 +239,17 @@ class MainWindow(QMainWindow):
         self.setStyleSheet(STYLE_SHEET)
 
         self.thread_pool = QThreadPool.globalInstance()
+        self.settings = QSettings("AUR Store", "AUR Store")
         self.packages: list[str] = []
+        self.installed: set[str] = set()
         self.info_cache: dict[str, dict] = {}
         self.info_inflight: set[str] = set()
         self.selected_name: str | None = None
         self.pending_info_name: str | None = None
         self.db_loading = False
+        self.pkexec_path = shutil.which("pkexec")
+        self.pkexec_available = self.pkexec_path is not None
+        self._state_timers: list[QTimer] = []
 
         self._search_timer = QTimer(self)
         self._search_timer.setSingleShot(True)
@@ -211,6 +264,15 @@ class MainWindow(QMainWindow):
         self._build_ui()
         self._install_shortcuts()
         self._load_db()
+        self._refresh_installed()
+
+    def changeEvent(self, event) -> None:
+        if (
+            event.type() == QEvent.Type.ActivationChange
+            and self.isActiveWindow()
+        ):
+            self._refresh_installed()
+        super().changeEvent(event)
 
     def _build_ui(self) -> None:
         central = QWidget(self)
@@ -230,7 +292,7 @@ class MainWindow(QMainWindow):
         titles.setSpacing(0)
         title = QLabel(APP_TITLE)
         title.setObjectName("title")
-        subtitle = QLabel("Поиск и установка пакетов из Arch User Repository")
+        subtitle = QLabel("Поиск, установка и удаление пакетов из Arch User Repository")
         subtitle.setObjectName("subtitle")
         titles.addWidget(title)
         titles.addWidget(subtitle)
@@ -274,18 +336,45 @@ class MainWindow(QMainWindow):
 
         actions = QHBoxLayout()
         actions.setSpacing(8)
-        hint = QLabel("Совет: PgUp/PgDown пролистывают сведения, Ctrl+F — поиск")
+        hint = QLabel("Ctrl+F — поиск")
         hint.setObjectName("subtitle")
+        hint.setToolTip("PgUp/PgDown пролистывают сведения о пакете")
         actions.addWidget(hint)
         actions.addStretch(1)
+        self.pkexec_checkbox = QCheckBox("Без консоли (pkexec)")
+        self.pkexec_checkbox.setToolTip(
+            "Запускать установку и удаление без терминала. Пароль "
+            "запрашивается графическим агентом polkit через pkexec."
+        )
+        if self.pkexec_available:
+            self.pkexec_checkbox.setChecked(
+                bool(self.settings.value("use_pkexec", False, type=bool))
+            )
+            self.pkexec_checkbox.toggled.connect(
+                lambda checked: self.settings.setValue("use_pkexec", checked)
+            )
+        else:
+            self.pkexec_checkbox.setChecked(False)
+            self.pkexec_checkbox.setEnabled(False)
+            self.pkexec_checkbox.setToolTip(
+                "pkexec не найден. Установите polkit, чтобы запускать действия "
+                "без терминала."
+            )
+
         self.open_button = QPushButton("Страница на AUR")
         self.open_button.setEnabled(False)
         self.open_button.clicked.connect(self._open_aur_page)
+        self.remove_button = QPushButton("Удалить")
+        self.remove_button.setObjectName("removeButton")
+        self.remove_button.setEnabled(False)
+        self.remove_button.clicked.connect(self._remove_selected)
         self.install_button = QPushButton("Установить")
         self.install_button.setObjectName("installButton")
         self.install_button.setEnabled(False)
         self.install_button.clicked.connect(self._install_selected)
+        actions.addWidget(self.pkexec_checkbox)
         actions.addWidget(self.open_button)
+        actions.addWidget(self.remove_button)
         actions.addWidget(self.install_button)
         root.addLayout(actions)
 
@@ -372,8 +461,7 @@ class MainWindow(QMainWindow):
         if not query:
             self.results.blockSignals(False)
             self.selected_name = None
-            self.install_button.setEnabled(False)
-            self.open_button.setEnabled(False)
+            self._update_action_buttons()
             self.details.setHtml(self._welcome_html(len(self.packages)))
             self.statusBar().showMessage(
                 "Введите название пакета для поиска по базе AUR."
@@ -381,13 +469,17 @@ class MainWindow(QMainWindow):
             return
 
         shown = aur.search_packages(self.packages, query, limit=SEARCH_LIMIT)
-        self.results.addItems(shown)
+        for name in shown:
+            item = QListWidgetItem(self._package_label(name))
+            item.setData(Qt.ItemDataRole.UserRole, name)
+            if name in self.installed:
+                item.setForeground(QColor("#1a7f37"))
+            self.results.addItem(item)
         self.results.blockSignals(False)
 
         if not shown:
             self.selected_name = None
-            self.install_button.setEnabled(False)
-            self.open_button.setEnabled(False)
+            self._update_action_buttons()
             self.details.setHtml(
                 self._message_html(
                     "Ничего не найдено",
@@ -405,14 +497,25 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(f"Найдено пакетов: {len(shown)}.")
 
         if previous:
-            matches = self.results.findItems(previous, Qt.MatchFlag.MatchExactly)
-            if matches:
-                self.results.setCurrentItem(matches[0])
-                return
+            for row in range(self.results.count()):
+                item = self.results.item(row)
+                if item.data(Qt.ItemDataRole.UserRole) == previous:
+                    self.results.setCurrentItem(item)
+                    return
 
         self.selected_name = None
-        self.install_button.setEnabled(False)
-        self.open_button.setEnabled(False)
+        self._update_action_buttons()
+
+    def _package_label(self, name: str) -> str:
+        return f"{name} · установлен" if name in self.installed else name
+
+    def _update_action_buttons(self) -> None:
+        name = self.selected_name
+        installed = bool(name and name in self.installed)
+        self.install_button.setText("Переустановить" if installed else "Установить")
+        self.install_button.setEnabled(bool(name))
+        self.remove_button.setEnabled(installed)
+        self.open_button.setEnabled(bool(name))
 
     def _focus_first_result(self) -> None:
         if self.results.count():
@@ -420,18 +523,19 @@ class MainWindow(QMainWindow):
             self.results.setFocus()
 
     def _on_selection_changed(self, current, _previous) -> None:
-        name = current.text() if current else None
+        name = current.data(Qt.ItemDataRole.UserRole) if current else None
         self.selected_name = name
         self._info_timer.stop()
-        self.install_button.setEnabled(bool(name))
-        self.open_button.setEnabled(bool(name))
+        self._update_action_buttons()
 
         if not name:
             self.details.setHtml(self._welcome_html(len(self.packages)))
             return
 
         if name in self.info_cache:
-            self.details.setHtml(aur.format_package_html(self.info_cache[name]))
+            self.details.setHtml(
+                aur.format_package_html(self.info_cache[name], name in self.installed)
+            )
             return
 
         self.details.setHtml(
@@ -462,7 +566,9 @@ class MainWindow(QMainWindow):
         self.info_inflight.discard(name)
         self.info_cache[name] = info
         if name == self.selected_name:
-            self.details.setHtml(aur.format_package_html(info))
+            self.details.setHtml(
+                aur.format_package_html(info, name in self.installed)
+            )
             self.statusBar().showMessage(f"Сведения о «{name}» загружены.")
 
     def _on_info_failed(self, name: str, message: str) -> None:
@@ -475,6 +581,31 @@ class MainWindow(QMainWindow):
                 )
             )
             self.statusBar().showMessage("Ошибка загрузки сведений о пакете.")
+
+    def _refresh_installed(self) -> None:
+        worker = _Worker(_installed_packages)
+        worker.signals.finished.connect(self._on_installed_loaded)
+        worker.signals.failed.connect(lambda _message: None)
+        self.thread_pool.start(worker)
+
+    def _on_installed_loaded(self, installed: set[str] | None) -> None:
+        if installed is None:
+            return
+        self.installed = installed
+        if self.packages:
+            self._apply_filter()
+        self._update_action_buttons()
+
+    def _ensure_pkexec(self) -> bool:
+        if self.pkexec_available:
+            return True
+        QMessageBox.critical(
+            self,
+            "pkexec не найден",
+            "Для работы без консоли нужен pkexec (пакет polkit).\n"
+            "Установите polkit или выключите режим «Без консоли».",
+        )
+        return False
 
     def _install_selected(self) -> None:
         name = self.selected_name
@@ -489,26 +620,126 @@ class MainWindow(QMainWindow):
             )
             return
 
+        installed = name in self.installed
+        no_console = self.pkexec_checkbox.isChecked()
+        if no_console and not self._ensure_pkexec():
+            return
+
+        if installed:
+            title = "Переустановка пакета"
+            question = (
+                f"Пересобрать и переустановить пакет «{name}»?\n\n"
+                "Пакет и все его AUR-зависимости будут склонированы и собраны "
+                "заново через makepkg."
+            )
+        else:
+            title = "Установка пакета"
+            question = (
+                f"Установить пакет «{name}»?\n\n"
+                "Пакет и все его AUR-зависимости будут склонированы и собраны "
+                "через makepkg."
+            )
+        password_hint = (
+            "Пароль будет запрошен через pkexec (polkit)."
+            if no_console
+            else "Для установки зависимостей и пакета может потребоваться пароль sudo."
+        )
         answer = QMessageBox.question(
             self,
-            "Установка пакета",
-            f"Установить пакет «{name}»?\n\n"
-            "Пакет и все его AUR-зависимости будут склонированы и собраны "
-            "через makepkg. Для установки зависимостей и пакета может "
-            "потребоваться пароль sudo.",
+            title,
+            f"{question}\n\n{password_hint}",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
             QMessageBox.StandardButton.Yes,
         )
         if answer != QMessageBox.StandardButton.Yes:
             return
 
-        command = [sys.executable, "-u", str(HELPER_PATH), "install", name]
-        title = f"{APP_TITLE} — установка {name}"
-        if not self._launch_in_terminal(command, title, name):
-            self._run_with_log_dialog(command, name)
+        command = [sys.executable, "-u", str(HELPER_PATH), "install"]
+        if installed:
+            command.append("--force")
+        if no_console:
+            command.append("--noconfirm")
+        command.append(name)
+
+        action = "Переустановка" if installed else "Установка"
+        window_title = f"{APP_TITLE} — {action.lower()} {name}"
+
+        if no_console:
+            self._run_with_log_dialog(
+                command,
+                name,
+                title=window_title,
+                notice=(
+                    "Пароль запрашивается через pkexec (polkit). "
+                    "Вывод сборки и установки показывается здесь."
+                ),
+                action=action,
+                env={"PACMAN_AUTH": self.pkexec_path or "pkexec"},
+            )
+            return
+
+        if self._launch_in_terminal(command, window_title, name, action=action):
+            self._watch_package_state(name, expected_installed=True)
+        else:
+            self._run_with_log_dialog(
+                command, name, title=window_title, action=action
+            )
+
+    def _remove_selected(self) -> None:
+        name = self.selected_name
+        if not name or name not in self.installed:
+            return
+
+        no_console = self.pkexec_checkbox.isChecked()
+        if no_console and not self._ensure_pkexec():
+            return
+
+        password_hint = (
+            "Пароль будет запрошен через pkexec (polkit)."
+            if no_console
+            else "Может потребоваться пароль sudo."
+        )
+        answer = QMessageBox.warning(
+            self,
+            "Удаление пакета",
+            f"Удалить пакет «{name}»?\n\n"
+            "Вместе с ним будут удалены зависимости, которые больше не нужны "
+            "другим пакетам. Это действие необратимо.\n\n"
+            f"{password_hint}",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+
+        title = f"{APP_TITLE} — удаление {name}"
+        if no_console:
+            command = [self.pkexec_path, "pacman", "-Rns", "--noconfirm", name]
+            self._run_with_log_dialog(
+                command,
+                name,
+                title=title,
+                notice=(
+                    "Пароль запрашивается через pkexec (polkit). "
+                    "Вывод pacman показывается здесь."
+                ),
+                action="Удаление",
+            )
+            return
+
+        command = ["sudo", "pacman", "-Rns", "--noconfirm", name]
+        if self._launch_in_terminal(command, title, name, action="Удаление"):
+            self._watch_package_state(name, expected_installed=False)
+        else:
+            self._run_with_log_dialog(command, name, title=title, action="Удаление")
 
     def _launch_in_terminal(
-        self, command: list[str], title: str, package: str
+        self,
+        command: list[str],
+        title: str,
+        package: str,
+        *,
+        action: str = "Установка",
     ) -> bool:
         script = (
             f"cd {shlex.quote(str(SCRIPT_DIR))} && {shlex.join(command)}; "
@@ -530,24 +761,68 @@ class MainWindow(QMainWindow):
         except OSError:
             return False
         self.statusBar().showMessage(
-            f"Установка «{package}» запущена в терминале."
+            f"{action} «{package}»: запущено в терминале."
         )
         return True
 
-    def _run_with_log_dialog(self, command: list[str], name: str) -> None:
+    def _watch_package_state(
+        self, name: str, *, expected_installed: bool
+    ) -> None:
+        if shutil.which("pacman") is None:
+            return
+
+        timer = QTimer(self)
+        timer.setInterval(2000)
+        self._state_timers.append(timer)
+        deadline = time.monotonic() + 30 * 60
+
+        def stop() -> None:
+            timer.stop()
+            if timer in self._state_timers:
+                self._state_timers.remove(timer)
+            timer.deleteLater()
+
+        def check() -> None:
+            installed = _installed_packages()
+            if installed is not None:
+                current = name in installed
+                if current == expected_installed:
+                    stop()
+                    self._on_installed_loaded(installed)
+                    return
+            if time.monotonic() >= deadline:
+                stop()
+
+        timer.timeout.connect(check)
+        timer.start()
+
+    def _run_with_log_dialog(
+        self,
+        command: list[str],
+        name: str,
+        *,
+        title: str | None = None,
+        notice: str | None = None,
+        action: str = "Установка",
+        env: dict[str, str] | None = None,
+    ) -> None:
         dialog = QDialog(self)
-        dialog.setWindowTitle(f"Установка {name}")
+        dialog.setWindowTitle(title or f"Установка {name}")
         dialog.resize(820, 520)
         layout = QVBoxLayout(dialog)
         layout.setContentsMargins(12, 12, 12, 12)
 
-        notice = QLabel(
-            "Терминальный эмулятор не найден, поэтому вывод показывается здесь. "
-            "Интерактивный ввод (например, пароль sudo) в этом режиме недоступен — "
-            "установите xterm или запустите helper вручную из терминала."
+        notice_label = QLabel(
+            notice
+            or (
+                "Терминальный эмулятор не найден, поэтому вывод показывается "
+                "здесь. Интерактивный ввод (например, пароль sudo) в этом режиме "
+                "недоступен — установите xterm или запустите helper вручную "
+                "из терминала."
+            )
         )
-        notice.setWordWrap(True)
-        layout.addWidget(notice)
+        notice_label.setWordWrap(True)
+        layout.addWidget(notice_label)
 
         output = QPlainTextEdit()
         output.setReadOnly(True)
@@ -564,6 +839,11 @@ class MainWindow(QMainWindow):
         process = QProcess(dialog)
         process.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
         process.setWorkingDirectory(str(SCRIPT_DIR))
+        if env:
+            process_env = QProcessEnvironment.systemEnvironment()
+            for key, value in env.items():
+                process_env.insert(key, value)
+            process.setProcessEnvironment(process_env)
 
         def append_output() -> None:
             data = bytes(process.readAllStandardOutput()).decode("utf-8", "replace")
@@ -573,6 +853,13 @@ class MainWindow(QMainWindow):
         def process_finished(code: int, _status) -> None:
             append_output()
             output.appendPlainText(f"\nПроцесс завершён с кодом {code}.")
+            self._refresh_installed()
+            if code == 0:
+                self.statusBar().showMessage(f"{action} «{name}»: завершено.")
+            else:
+                self.statusBar().showMessage(
+                    f"{action} «{name}»: завершено с ошибкой (код {code})."
+                )
 
         process.readyReadStandardOutput.connect(append_output)
         process.finished.connect(process_finished)
@@ -590,7 +877,7 @@ class MainWindow(QMainWindow):
         dialog.finished.connect(lambda _result: close_dialog())
 
         process.start(command[0], command[1:])
-        self.statusBar().showMessage(f"Установка «{name}» запущена.")
+        self.statusBar().showMessage(f"{action} «{name}»: запущено.")
         dialog.exec()
 
     def _open_aur_page(self) -> None:
@@ -608,9 +895,12 @@ class MainWindow(QMainWindow):
             "сразу по базе Arch User Repository.<br><br>"
             f"В локальной базе: <b>{_thousands(count)}</b> пакетов.<br><br>"
             "Выберите пакет, чтобы посмотреть описание, версию, сопровождающего, "
-            "зависимости и другую информацию со страницы AUR. Кнопка "
-            "«Установить» запустит <code>aur_helper.py</code>, который склонирует "
-            "репозиторий и соберёт пакет через <code>makepkg</code>.",
+            "зависимости и другую информацию со страницы AUR. Установленные "
+            "пакеты помечаются в списке; для них доступны переустановка и "
+            "удаление. Кнопка «Установить» запустит <code>aur_helper.py</code>, "
+            "который склонирует репозиторий и соберёт пакет через "
+            "<code>makepkg</code>. Режим «Без консоли» использует "
+            "<code>pkexec</code> для запроса пароля.",
         )
 
     @staticmethod
