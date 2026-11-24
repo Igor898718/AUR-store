@@ -30,18 +30,58 @@
 | `aur.py` | клиент AUR: загрузка базы, поиск, разбор HTML-страницы пакета |
 | `aur_helper.py` | AUR helper: рекурсивные зависимости, клонирование и сборка через `makepkg` |
 | `setup.sh` | создание/пересоздание `.venv` и установка зависимостей |
+| `build_portable.sh` | сборка portable-бинарника через PyInstaller |
+| `requirements-build.txt` | зависимости для сборки бинарника |
+| `.github/workflows/build.yml` | CI-сборка в Arch-контейнере и публикация релиза |
 | `images/archicon.png` | иконка приложения |
 
 ## Требования
 
-- Python 3.10+;
-- PyQt6;
-- для сборки пакетов — Arch Linux (или производный дистрибутив), пакеты
-  `base-devel` и `git`;
+Для готового бинарника:
+
+- Arch Linux (или производный дистрибутив) x86_64;
+- для сборки AUR-пакетов — `base-devel` и `git`;
 - для режима «Без консоли» — `pkexec` и работающий агент polkit (обычно входят
   в состав графического окружения).
 
-## Установка и запуск
+Для запуска из исходников дополнительно нужны Python 3.10+ и PyQt6.
+
+## Установка готового исполняемого файла
+
+Готовые сборки публикуются в
+[Releases](https://github.com/Igor898718/AUR-store/releases). Бинарник собран
+для Arch Linux x86_64 и не требует установленного Python или PyQt6:
+интерпретатор и Qt уже включены в файл.
+
+Скачайте исполняемый файл, сделайте его исполняемым и запустите:
+
+```bash
+curl -LO https://github.com/Igor898718/AUR-store/releases/latest/download/aur-store-linux-x86_64
+chmod +x aur-store-linux-x86_64
+./aur-store-linux-x86_64
+```
+
+Можно скачать архив — он сохраняет права на запуск:
+
+```bash
+curl -LO https://github.com/Igor898718/AUR-store/releases/latest/download/aur-store-linux-x86_64.tar.gz
+tar -xzf aur-store-linux-x86_64.tar.gz
+./aur-store-linux-x86_64
+```
+
+Проверка контрольной суммы:
+
+```bash
+curl -LO https://github.com/Igor898718/AUR-store/releases/latest/download/aur-store-linux-x86_64.sha256
+sha256sum -c aur-store-linux-x86_64.sha256
+```
+
+Для установки пакетов из AUR всё равно нужны `base-devel`, `git` и
+настроенный `pacman`. Бинарник не является системным пакетом: удалите
+скачанный файл, когда он не нужен. Из-за системных библиотек он рассчитан
+прежде всего на Arch Linux и не гарантирует работу на других дистрибутивах.
+
+## Запуск из исходников
 
 ```bash
 ./setup.sh
@@ -89,6 +129,32 @@ git rm -r --cached .venv
 
 Удаление выполняется командой `pacman -Rns --noconfirm`, поэтому вместе с
 пакетом удаляются зависимости, которые больше не нужны другим пакетам.
+
+## Сборка portable-бинарника
+
+```bash
+./build_portable.sh
+```
+
+Скрипт создаёт отдельное окружение `.build-venv`, устанавливает PyInstaller и
+собирает onefile-бинарник. Готовые файлы появляются в `dist/`:
+
+- `aur-store-linux-<arch>` — исполняемый файл;
+- `aur-store-linux-<arch>.tar.gz` — архив с сохранением прав на запуск;
+- `aur-store-linux-<arch>.sha256` — контрольная сумма исполняемого файла;
+- `aur-store-linux-<arch>.tar.gz.sha256` — контрольная сумма архива.
+
+Можно указать другой каталог для сборочного окружения:
+
+```bash
+BUILD_VENV=/tmp/aur-store-build ./build_portable.sh
+```
+
+Для публикации на GitHub добавлен workflow
+`.github/workflows/build.yml`. Он собирает бинарник в контейнере
+`archlinux:latest` при пуше тега вида `v*`, прикрепляет файлы к релизу, а при
+ручном запуске сохраняет их как artifact. Локальная сборка на не-Arc
+дистрибутиве возможна, но для релиза используйте CI или Arch-машину.
 
 ## Использование helper'а отдельно
 

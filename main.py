@@ -68,12 +68,26 @@ except ModuleNotFoundError as exc:
     raise
 
 import aur
+import aur_helper
 
 APP_TITLE = "AUR Store"
 SEARCH_LIMIT = 500
-SCRIPT_DIR = Path(__file__).resolve().parent
+FROZEN = bool(getattr(sys, "frozen", False))
+HELPER_SENTINEL = "--aur-helper"
+SCRIPT_DIR = (
+    Path(getattr(sys, "_MEIPASS", Path(sys.executable).resolve().parent))
+    if FROZEN
+    else Path(__file__).resolve().parent
+)
 HELPER_PATH = SCRIPT_DIR / "aur_helper.py"
 ICON_PATH = SCRIPT_DIR / "images" / "archicon.png"
+WORK_DIR = Path.home() if FROZEN else SCRIPT_DIR
+HELPER_AVAILABLE = FROZEN or HELPER_PATH.is_file()
+HELPER_COMMAND = (
+    [str(Path(sys.executable).resolve()), HELPER_SENTINEL]
+    if FROZEN
+    else [sys.executable, "-u", str(HELPER_PATH)]
+)
 
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 
@@ -611,7 +625,7 @@ class MainWindow(QMainWindow):
         name = self.selected_name
         if not name:
             return
-        if not HELPER_PATH.is_file():
+        if not HELPER_AVAILABLE:
             QMessageBox.critical(
                 self,
                 "Helper не найден",
@@ -654,7 +668,7 @@ class MainWindow(QMainWindow):
         if answer != QMessageBox.StandardButton.Yes:
             return
 
-        command = [sys.executable, "-u", str(HELPER_PATH), "install"]
+        command = [*HELPER_COMMAND, "install"]
         if installed:
             command.append("--force")
         if no_console:
@@ -742,7 +756,7 @@ class MainWindow(QMainWindow):
         action: str = "Установка",
     ) -> bool:
         script = (
-            f"cd {shlex.quote(str(SCRIPT_DIR))} && {shlex.join(command)}; "
+            f"cd {shlex.quote(str(WORK_DIR))} && {shlex.join(command)}; "
             "status=$?; echo; "
             "if [ \"$status\" -eq 0 ]; then echo 'Готово.'; "
             "else echo \"Ошибка (код $status).\"; fi; "
@@ -838,7 +852,7 @@ class MainWindow(QMainWindow):
 
         process = QProcess(dialog)
         process.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
-        process.setWorkingDirectory(str(SCRIPT_DIR))
+        process.setWorkingDirectory(str(WORK_DIR))
         if env:
             process_env = QProcessEnvironment.systemEnvironment()
             for key, value in env.items():
@@ -947,6 +961,9 @@ def _terminal_command(title: str, script: str) -> list[str] | None:
 
 
 def main() -> int:
+    if len(sys.argv) > 1 and sys.argv[1] == HELPER_SENTINEL:
+        return aur_helper.main(sys.argv[2:])
+
     app = QApplication(sys.argv)
     app.setApplicationName(APP_TITLE)
     app.setApplicationDisplayName(APP_TITLE)
