@@ -1,6 +1,4 @@
-#!/bin/sh
-'''exec' "/home/arch/AUR store/.venv/bin/python" "$0" "$@"
-' '''
+#!/home/igor/fl/Portfolio/Projects/AUR-store/.venv/bin/python3
 # -*- coding: utf-8 -*-
 import re
 import sys
